@@ -154,3 +154,88 @@ jobs:
         run: go test -parallel=1 -race  ./...
         env:
           PGX_TEST_DATABASE: ${{ steps.postgres.outputs.connection-uri }}
+
+  module-zip:
+    name: Module Zip
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      # The Go module zip INCLUDES .github/ (the published v5.7.6.zip carries a
+      # 9129-byte .github/workflows/ci.yml entry). Restore the pristine tag copy
+      # so neither this job nor the forced workflow_dispatch rewrite ships inside
+      # the artifact and breaks byte-parity.
+      - name: Restore pristine .github from upstream tag v5.7.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          fetched=0
+          for attempt in 1 2 3 4 5; do
+            echo "Fetching upstream refs/tags/v5.7.6 (attempt ${attempt}/5)"
+            if git fetch --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/jackc/pgx.git" refs/tags/v5.7.6; then
+              fetched=1
+              break
+            fi
+            echo "fetch attempt ${attempt} failed; retrying"
+            sleep 15
+          done
+          if [ "${fetched}" -ne 1 ]; then
+            echo "::error::could not fetch upstream refs/tags/v5.7.6 after 5 attempts"
+            exit 1
+          fi
+          rm -rf .github
+          git checkout FETCH_HEAD -- .github
+          ls -l .github/workflows/ci.yml
+
+      # The helper lives in RUNNER_TEMP, never in the repo tree: any file inside
+      # the zipped directory becomes an extra entry and fails verification.
+      - name: Build the Go module zip
+        run: |
+          mkdir -p "${RUNNER_TEMP}/ziphelper"
+          cat > "${RUNNER_TEMP}/ziphelper/main.go" <<'GOEOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 3 {
+                  log.Fatal("usage: go run . <source-dir> <output-zip>")
+              }
+              srcDir := os.Args[1]
+              out, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer out.Close()
+              m := module.Version{Path: "github.com/jackc/pgx/v5", Version: "v5.7.6"}
+              if err := zip.CreateFromDir(out, m, srcDir); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[2])
+          }
+          GOEOF
+          cd "${RUNNER_TEMP}/ziphelper"
+          go mod init ziphelper
+          go get golang.org/x/mod@v0.24.0
+          go run . "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/v5.7.6.zip"
+          ls -l "${RUNNER_TEMP}/v5.7.6.zip"
+
+      - name: Upload the Go module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/v5.7.6.zip
+          if-no-files-found: error
